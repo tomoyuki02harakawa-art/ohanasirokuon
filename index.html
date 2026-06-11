@@ -33,6 +33,27 @@
             color: #ff4500;
             height: 30px;
             margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        /* 録音中であることが「読めない子」にも分かる点滅ランプ */
+        .rec-dot {
+            display: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background-color: #ff4500;
+            animation: blink 1s infinite;
+        }
+        .recording .rec-dot { display: inline-block; }
+        @keyframes blink {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.3; transform: scale(0.8); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .rec-dot { animation: none; }
         }
         textarea {
             width: 100%;
@@ -47,9 +68,11 @@
             margin-bottom: 20px;
             background-color: #fafafa;
         }
+        /* 録音中はテキスト欄の枠も赤くして状態を二重に伝える */
+        .recording textarea { border-color: #ff8c69; }
         .button-group {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: 1fr 1fr 1fr;
             gap: 15px;
         }
         button {
@@ -66,22 +89,28 @@
             transform: translateY(2px);
             box-shadow: 0 2px 3px rgba(0,0,0,0.1);
         }
-        #startBtn { background-color: #ffb6c1; color: #333; grid-column: span 2; padding: 20px; font-size: 24px; }
-        #stopBtn { background-color: #d3d3d3; color: #333; grid-column: span 2; padding: 20px; font-size: 24px; display: none; }
+        button:focus-visible { outline: 3px solid #4682b4; }
+        #startBtn { background-color: #ffb6c1; color: #333; grid-column: span 3; padding: 20px; font-size: 24px; }
+        #stopBtn { background-color: #d3d3d3; color: #333; grid-column: span 3; padding: 20px; font-size: 24px; display: none; }
+        #listenBtn { background-color: #98fb98; color: #333; }
         #copyBtn { background-color: #87cefa; color: #333; }
         #clearBtn { background-color: #ffddca; color: #333; }
     </style>
 </head>
 <body>
-    <div class="container">
+    <div class="container" id="appContainer">
         <h1>🗣️ おはなしノート</h1>
-        <div class="status" id="statusText">マイクのボタンをおしてね</div>
-        
-        <textarea id="resultText" placeholder="ここにはなしたことばがでるよ"></textarea>
-        
+        <div class="status" id="statusBox">
+            <span class="rec-dot" aria-hidden="true"></span>
+            <span id="statusText">マイクのボタンをおしてね</span>
+        </div>
+
+        <textarea id="resultText" placeholder="ここにはなしたことばがでるよ" aria-label="はなしたことば"></textarea>
+
         <div class="button-group">
             <button id="startBtn">🎤 はなす</button>
             <button id="stopBtn">⏹️ とめる</button>
+            <button id="listenBtn">🔊 きく</button>
             <button id="copyBtn">📋 コピー</button>
             <button id="clearBtn">🗑️ けす</button>
         </div>
@@ -90,16 +119,39 @@
     <script>
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
+        const listenBtn = document.getElementById('listenBtn');
         const copyBtn = document.getElementById('copyBtn');
         const clearBtn = document.getElementById('clearBtn');
         const resultText = document.getElementById('resultText');
         const statusText = document.getElementById('statusText');
+        const appContainer = document.getElementById('appContainer');
+
+        const DEFAULT_MSG = 'マイクのボタンをおしてね';
+        let statusTimer = null;
+
+        function setStatus(msg, resetAfterMs) {
+            clearTimeout(statusTimer);
+            statusText.innerText = msg;
+            if (resetAfterMs) {
+                statusTimer = setTimeout(() => {
+                    // 録音中なら録音中表示を維持する
+                    statusText.innerText = isRecording ? '🔴 ろくおんちゅう... はなしてね' : DEFAULT_MSG;
+                }, resetAfterMs);
+            }
+        }
 
         // ブラウザの音声認識機能（Web Speech API）を呼び出す
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
+        // ===== 修正点の中心となる状態管理 =====
+        // baseText: 録音開始時点の確定テキスト（手動編集もここに含まれるので消えない）
+        // sessionFinal: 今回の認識セッションで確定した分
+        let baseText = '';
+        let sessionFinal = '';
+        let isRecording = false; // 「とめる」を押すまで true（無音で切れても自動再開する）
+
         if (!SpeechRecognition) {
-            statusText.innerText = "⚠️ このブラウザではつかえません。Chromeをつかってね。";
+            setStatus('⚠️ このブラウザではつかえません。SafariかChromeをつかってね。');
             startBtn.disabled = true;
         } else {
             const recognition = new SpeechRecognition();
@@ -107,65 +159,202 @@
             recognition.interimResults = true; // 話している途中の言葉も表示する
             recognition.continuous = true;     // 続けて認識する
 
-            let finalTranscript = '';
-
             recognition.onstart = () => {
-                statusText.innerText = "🔴 ろくおんちゅう... はなしてね";
+                setStatus('🔴 ろくおんちゅう... はなしてね');
                 startBtn.style.display = 'none';
                 stopBtn.style.display = 'block';
+                appContainer.classList.add('recording');
             };
 
             recognition.onresult = (event) => {
-                let interimTranscript = '';
-                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                // iPad(iOS Safari/Chrome)では resultIndex の挙動が異なり文字が重複するため、
+                // 毎回すべての結果から組み立て直す方式にする
+                let interim = '';
+                sessionFinal = '';
+                for (let i = 0; i < event.results.length; i++) {
+                    const transcript = event.results[i][0].transcript;
                     if (event.results[i].isFinal) {
-                        finalTranscript += event.results[i][0].transcript + '。';
+                        sessionFinal += transcript + '。\n'; // 文ごとに改行して読みやすく
                     } else {
-                        interimTranscript += event.results[i][0].transcript;
+                        interim += transcript;
                     }
                 }
-                resultText.value = finalTranscript + interimTranscript;
+                resultText.value = baseText + sessionFinal + interim;
+                resultText.scrollTop = resultText.scrollHeight; // 長文でも最新の言葉が見える
             };
 
             recognition.onerror = (event) => {
                 console.error(event.error);
-                statusText.innerText = "⚠️ エラーがおきました。もういちどやりなおしてね。";
-                resetButtons();
+                if (event.error === 'no-speech' || event.error === 'aborted') {
+                    // ただ黙っていただけ。エラー表示で子どもを驚かせず、onend の自動再開に任せる
+                    return;
+                }
+                if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+                    isRecording = false;
+                    setStatus('⚠️ マイクがつかえません。せんせいによんでね。');
+                    return;
+                }
+                isRecording = false;
+                setStatus('⚠️ うまくいかなかったよ。もういちどやってみてね。');
             };
 
             recognition.onend = () => {
-                statusText.innerText = "マイクのボタンをおしてね";
+                // 今回のセッション分を確定テキストに合流させる
+                baseText = baseText + sessionFinal;
+                sessionFinal = '';
+                resultText.value = baseText;
+
+                if (isRecording) {
+                    // 「とめる」を押していないのに無音などで切れた場合は自動で再開する
+                    try {
+                        recognition.start();
+                        return;
+                    } catch (e) {
+                        console.error(e);
+                        isRecording = false;
+                    }
+                }
+                setStatus(DEFAULT_MSG);
                 resetButtons();
             };
 
             startBtn.addEventListener('click', () => {
-                recognition.start();
+                stopSpeaking(); // 読み上げ中の音声をマイクが拾わないように止める
+                // 録音開始時点のテキスト欄の内容を基準にする
+                // → 手動で直した文章が次の録音で消えるバグを防ぐ
+                baseText = resultText.value;
+                if (baseText && !/\n$/.test(baseText)) {
+                    baseText = baseText.replace(/\s+$/, '');
+                    if (!/[。．！!？?]$/.test(baseText)) {
+                        baseText += '。'; // 前の文とつながらないように区切る
+                    }
+                    baseText += '\n';
+                }
+                sessionFinal = '';
+                isRecording = true;
+                try {
+                    recognition.start();
+                } catch (e) {
+                    console.error(e);
+                    isRecording = false;
+                    setStatus('⚠️ もういちどボタンをおしてね。');
+                }
             });
 
             stopBtn.addEventListener('click', () => {
+                isRecording = false; // 自動再開を止める
                 recognition.stop();
             });
 
-            copyBtn.addEventListener('click', () => {
-                navigator.clipboard.writeText(resultText.value).then(() => {
-                    statusText.innerText = "✨ コピーしました！AIにはりつけてね";
-                    setTimeout(() => statusText.innerText = "マイクのボタンをおしてね", 3000);
-                });
+            copyBtn.addEventListener('click', async () => {
+                const text = resultText.value;
+                if (!text) {
+                    setStatus('まだことばがないよ。はなしてみてね。', 3000);
+                    return;
+                }
+                try {
+                    await navigator.clipboard.writeText(text);
+                    setStatus('✨ コピーしました！', 3000);
+                } catch (e) {
+                    // https以外・古い端末向けの代替コピー
+                    try {
+                        resultText.focus();
+                        resultText.select();
+                        const ok = document.execCommand('copy');
+                        resultText.setSelectionRange(text.length, text.length);
+                        setStatus(ok ? '✨ コピーしました！' : '⚠️ コピーできなかったよ。', 3000);
+                    } catch (e2) {
+                        setStatus('⚠️ コピーできなかったよ。', 3000);
+                    }
+                }
             });
 
             clearBtn.addEventListener('click', () => {
-                if(confirm("ほんとうに ぜんぶけしますか？")) {
-                    finalTranscript = '';
+                if (confirm('ほんとうに ぜんぶけしますか？')) {
+                    stopSpeaking();
+                    baseText = '';
+                    sessionFinal = '';
                     resultText.value = '';
-                    statusText.innerText = "✨ ぜんぶけしました";
-                    setTimeout(() => statusText.innerText = "マイクのボタンをおしてね", 2000);
+                    setStatus('✨ ぜんぶけしました', 2000);
                 }
             });
 
             function resetButtons() {
                 startBtn.style.display = 'block';
                 stopBtn.style.display = 'none';
+                appContainer.classList.remove('recording');
             }
+        }
+
+        // ===== 読み上げ機能（ブラウザ内蔵・APIキー不要・通信不要） =====
+        let isSpeaking = false;
+
+        function resetListenBtn() {
+            isSpeaking = false;
+            listenBtn.innerText = '🔊 きく';
+        }
+
+        function stopSpeaking() {
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
+            }
+            if (isSpeaking) {
+                resetListenBtn();
+                setStatus(DEFAULT_MSG);
+            }
+        }
+
+        function speakText(text) {
+            // 長文を一気に読ませると一部の端末で途中停止するため、文ごとに分けて順に読む
+            const sentences = [];
+            text.split(/\n+/).forEach((line) => {
+                line.split('。').forEach((s) => {
+                    const t = s.trim();
+                    if (t) sentences.push(t + '。');
+                });
+            });
+            if (sentences.length === 0) return;
+
+            window.speechSynthesis.cancel();
+            isSpeaking = true;
+            listenBtn.innerText = '⏹️ やめる';
+            setStatus('🔊 よんでいるよ...');
+
+            sentences.forEach((sentence, index) => {
+                const utter = new SpeechSynthesisUtterance(sentence);
+                utter.lang = 'ja-JP';
+                utter.rate = 0.95; // ほんの少しゆっくり
+                if (index === sentences.length - 1) {
+                    utter.onend = () => {
+                        if (isSpeaking) {
+                            resetListenBtn();
+                            setStatus(DEFAULT_MSG);
+                        }
+                    };
+                }
+                window.speechSynthesis.speak(utter);
+            });
+        }
+
+        if (!('speechSynthesis' in window)) {
+            listenBtn.disabled = true;
+        } else {
+            listenBtn.addEventListener('click', () => {
+                if (isSpeaking) {
+                    stopSpeaking();
+                    return;
+                }
+                if (isRecording) {
+                    setStatus('ろくおんちゅうは きけないよ。', 3000);
+                    return;
+                }
+                const text = resultText.value.trim();
+                if (!text) {
+                    setStatus('まだことばがないよ。はなしてみてね。', 3000);
+                    return;
+                }
+                speakText(text);
+            });
         }
     </script>
 </body>
